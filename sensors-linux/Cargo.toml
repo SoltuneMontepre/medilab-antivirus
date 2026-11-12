@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 av-core = { path = "../core" }
+libc = "0.2"
 log = "0.4"
 
 [dev-dependencies]

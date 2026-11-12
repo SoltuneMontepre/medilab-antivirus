@@ -3,12 +3,14 @@
 
 pub mod archive;
 pub mod cache;
+pub mod watch;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -26,6 +28,7 @@ pub struct Config {
     pub archives: archive::Limits,
     /// Where the verdict cache lives. None = per-OS default chosen by the daemon.
     pub cache_dir: Option<PathBuf>,
+    pub watch: watch::WatchConfig,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             trust: TrustConfig::default(),
             archives: archive::Limits::default(),
             cache_dir: None,
+            watch: watch::WatchConfig::default(),
         }
     }
 }
@@ -68,8 +72,8 @@ pub struct FileKey {
     pub marker: u128,
 }
 
-/// What the OS can tell core about a file. Implemented once per platform crate.
-pub trait Platform {
+/// What the OS can tell core about a file. Implemented once per platform crate; shared by every scanning thread.
+pub trait Platform: Send + Sync {
     fn file_key(&self, file: &File) -> io::Result<FileKey>;
     /// True only when the file is known-good (allowlisted signer, unmodified package file).
     /// `sha256` is the file's content digest, already computed by core.
@@ -160,55 +164,142 @@ const YARA_TIMEOUT: Duration = Duration::from_secs(10);
 /// Engine names a cached verdict may carry; anything else is treated as a miss.
 const ENGINES: [&str; 2] = ["hash", "yara"];
 
-pub struct Engine {
+/// Locks, ignoring poisoning (a worker panic must not wedge the cache).
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Loaded signatures and the settings that go with them. Immutable once loaded.
+struct Signatures {
     max_file_size: u64,
     archives: archive::Limits,
     trust_enabled: bool,
     /// SHA-256 → detection name.
     hashes: HashMap<[u8; 32], String>,
-    yara: yara_x::Scanner<'static>,
+    rules: &'static yara_x::Rules,
     ruleset: [u8; 32],
-    /// Set by the daemon. Without it nothing is cached or trusted: every file is read and scanned.
-    pub platform: Option<Box<dyn Platform>>,
-    /// Needs `platform` (for file identity). Open it with `Cache::load(.., engine.ruleset(), ..)`.
-    pub cache: Option<cache::Cache>,
 }
 
-impl Engine {
-    pub fn load(config: &Config) -> Result<Self, String> {
+/// Everything an engine needs except its YARA scanner (which is tied to one thread). Cheap to clone; clone it into
+/// another thread and call `Engine::new` there.
+#[derive(Clone)]
+pub struct Shared {
+    sigs: Arc<Signatures>,
+    /// Set by the daemon. Without it nothing is cached or trusted: every file is read and scanned.
+    pub platform: Option<Arc<dyn Platform>>,
+    /// Needs `platform` (for file identity). Open it with `Cache::load(.., shared.ruleset(), ..)`.
+    pub cache: Option<Arc<Mutex<cache::Cache>>>,
+    /// Real-time mode: `Engine::scan` skips files this filter does not want.
+    pub filter: Option<Arc<watch::Filter>>,
+}
+
+impl Shared {
+    pub fn load(config: &Config) -> Result<Shared, String> {
         // Everything that can change a verdict for unchanged bytes: signatures, archive limits, code version.
         let mut ruleset = Sha256::new();
         ruleset.update(env!("CARGO_PKG_VERSION"));
         ruleset.update(format!("{:?}", config.archives));
         let hashes = load_hashes(&config.hash_list, &mut ruleset)?;
-        // ponytail: Rules are leaked so the one Scanner can be 'static; each reload leaks the old set.
+        // ponytail: Rules are leaked so every Scanner can be 'static; each reload leaks the old set.
         let rules: &'static yara_x::Rules = Box::leak(Box::new(compile_rules(&config.rules_dir, &mut ruleset)?));
-        let mut yara = yara_x::Scanner::new(rules);
-        yara.set_timeout(YARA_TIMEOUT);
-        Ok(Self {
+        let sigs = Signatures {
             max_file_size: config.max_file_size,
             archives: config.archives,
             trust_enabled: config.trust.enabled,
             hashes,
-            yara,
+            rules,
             ruleset: ruleset.finalize().into(),
-            platform: None,
-            cache: None,
-        })
+        };
+        Ok(Shared { sigs: Arc::new(sigs), platform: None, cache: None, filter: None })
     }
 
     /// Fingerprint of the loaded signatures and settings; the cache is dropped when it changes.
     pub fn ruleset(&self) -> [u8; 32] {
-        self.ruleset
+        self.sigs.ruleset
+    }
+
+    /// Cache-only verdict for an open file: Some(true) cached clean, Some(false) cached detection, None = miss / no
+    /// cache. Never reads the file. (Used by Linux exec-permission checks on a latency-critical thread.)
+    pub fn cached_clean(&self, file: &File) -> Option<bool> {
+        let key = self.platform.as_ref()?.file_key(file).ok()?;
+        self.cached(Path::new(""), &key).map(|d| d.is_empty())
+    }
+
+    /// Identity key for caching; None when there is no cache or the platform can't tell.
+    fn file_key(&self, path: &Path, file: &File) -> Option<FileKey> {
+        match (&self.platform, &self.cache) {
+            (Some(platform), Some(_)) => platform
+                .file_key(file)
+                .map_err(|e| log::warn!("{}: file identity: {e}, not cached", path.display()))
+                .ok(),
+            _ => None,
+        }
+    }
+
+    /// The cached verdict for `key` as detections at `path`; None on a miss.
+    fn cached(&self, path: &Path, key: &FileKey) -> Option<Vec<Detection>> {
+        let mut cache = lock(self.cache.as_ref()?);
+        cache
+            .get(key)?
+            .iter()
+            .map(|c| {
+                Some(Detection {
+                    path: format!("{}{}", path.display(), c.inner).into(),
+                    sha256: c.sha256,
+                    engine: ENGINES.into_iter().find(|e| *e == c.engine)?,
+                    name: c.name.clone(),
+                    file_type: c.file_type,
+                })
+            })
+            .collect()
+    }
+
+    /// Reports the cached verdict for `key`, if there is one. The cache lock is released before `on_detection` runs.
+    fn replay(&self, path: &Path, key: &FileKey, stats: &mut Stats, on_detection: &mut dyn FnMut(Detection)) -> bool {
+        let Some(detections) = self.cached(path, key) else { return false };
+        stats.cache_hits += 1;
+        stats.detections += detections.len() as u64;
+        detections.into_iter().for_each(on_detection);
+        true
+    }
+
+    fn put(&self, key: Option<FileKey>, detections: Vec<cache::Cached>) {
+        if let (Some(key), Some(cache)) = (key, &self.cache) {
+            lock(cache).put(key, detections);
+        }
+    }
+}
+
+/// One scanning thread's engine: the shared signatures plus its own YARA scanner.
+pub struct Engine {
+    pub shared: Shared,
+    yara: yara_x::Scanner<'static>,
+}
+
+impl Engine {
+    pub fn new(shared: Shared) -> Engine {
+        let mut yara = yara_x::Scanner::new(shared.sigs.rules);
+        yara.set_timeout(YARA_TIMEOUT);
+        Engine { shared, yara }
+    }
+
+    pub fn load(config: &Config) -> Result<Engine, String> {
+        Ok(Engine::new(Shared::load(config)?))
+    }
+
+    /// Fingerprint of the loaded signatures and settings; the cache is dropped when it changes.
+    pub fn ruleset(&self) -> [u8; 32] {
+        self.shared.ruleset()
     }
 
     /// Scans a file or a directory tree. Per-file problems are logged and counted, never fatal.
     pub fn scan(&mut self, root: &Path, mut on_detection: impl FnMut(Detection)) -> Stats {
         let mut stats = Stats::default();
-        // ponytail: single-threaded; the M3 work queue adds workers.
         // follow_links(false) is walkdir's default, spelled out because it is what prevents
         // symlink loops and escaping the scan root.
         // Files before subdirectories, so each directory's files come out together and its listing is read once.
+        // ponytail: excluded directories are still walked (only their files are skipped); prune with filter_entry
+        // if big excluded trees show up in rescans.
         let walk =
             WalkDir::new(root).follow_links(false).sort_by(|a, b| a.file_type().is_dir().cmp(&b.file_type().is_dir()));
         let mut listing: Option<(PathBuf, HashMap<OsString, FileKey>)> = None;
@@ -225,10 +316,13 @@ impl Engine {
                 continue;
             }
             let path = entry.path();
+            if self.shared.filter.as_ref().is_some_and(|f| !f.wants(path)) {
+                continue;
+            }
             // ponytail: an NTFS directory listing lags while another process holds the file open for writing
             // (and for changes made through another hard link), so such a file can hit its old verdict until the
             // handle closes. M3's USN journal sees writes as they happen and is the fix.
-            let listed = match (&self.platform, &self.cache, path.parent(), entry.depth() > 0) {
+            let listed = match (&self.shared.platform, &self.shared.cache, path.parent(), entry.depth() > 0) {
                 (Some(platform), Some(_), Some(dir), true) => {
                     if listing.as_ref().is_none_or(|(d, _)| d != dir) {
                         listing = Some((dir.to_path_buf(), platform.dir_keys(dir).unwrap_or_default()));
@@ -245,45 +339,34 @@ impl Engine {
         stats
     }
 
-    /// Identity key for caching; None when there is no cache or the platform can't tell.
-    fn file_key(&self, path: &Path, file: &File) -> Option<FileKey> {
-        match (&self.platform, &self.cache) {
-            (Some(platform), Some(_)) => platform
-                .file_key(file)
-                .map_err(|e| log::warn!("{}: file identity: {e}, not cached", path.display()))
-                .ok(),
-            _ => None,
+    /// Scans an already-open file from offset 0: size limit, cache, trust, engines, cache put — same as a walked
+    /// file. Used for fanotify fds (no path race).
+    pub fn scan_handle(&mut self, path: &Path, file: File, mut on_detection: impl FnMut(Detection)) -> Stats {
+        let mut stats = Stats::default();
+        if let Err(e) = self.scan_handle_inner(path, file, &mut stats, &mut on_detection) {
+            log::warn!("{}: {e}", path.display());
+            stats.errors += 1;
         }
+        stats
     }
 
-    /// Reports the cached verdict for `key`, if there is one.
-    fn replay(
+    fn scan_handle_inner(
         &mut self,
         path: &Path,
-        key: &FileKey,
+        mut file: File,
         stats: &mut Stats,
         on_detection: &mut dyn FnMut(Detection),
-    ) -> bool {
-        let Some(cache) = &mut self.cache else { return false };
-        let hit = cache.get(key).and_then(|cached| {
-            cached
-                .iter()
-                .map(|c| {
-                    Some(Detection {
-                        path: format!("{}{}", path.display(), c.inner).into(),
-                        sha256: c.sha256,
-                        engine: ENGINES.into_iter().find(|e| *e == c.engine)?,
-                        name: c.name.clone(),
-                        file_type: c.file_type,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()
-        });
-        let Some(detections) = hit else { return false };
-        stats.cache_hits += 1;
-        stats.detections += detections.len() as u64;
-        detections.into_iter().for_each(on_detection);
-        true
+    ) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        if file.metadata()?.len() > self.shared.sigs.max_file_size {
+            stats.skipped += 1;
+            return Ok(());
+        }
+        let key = self.shared.file_key(path, &file);
+        if key.is_some_and(|key| self.shared.replay(path, &key, stats, on_detection)) {
+            return Ok(());
+        }
+        self.scan_open(path, file, key, stats, on_detection)
     }
 
     /// One file: cache → size check → read → trust → engines → cache.
@@ -295,16 +378,16 @@ impl Engine {
         stats: &mut Stats,
         on_detection: &mut dyn FnMut(Detection),
     ) -> io::Result<()> {
-        if listed.is_some_and(|key| self.replay(path, &key, stats, on_detection)) {
+        if listed.is_some_and(|key| self.shared.replay(path, &key, stats, on_detection)) {
             return Ok(());
         }
         let meta = open_metadata_only(path)?;
-        if meta.metadata()?.len() > self.max_file_size {
+        if meta.metadata()?.len() > self.shared.sigs.max_file_size {
             stats.skipped += 1;
             return Ok(());
         }
         if listed.is_none()
-            && self.file_key(path, &meta).is_some_and(|key| self.replay(path, &key, stats, on_detection))
+            && self.shared.file_key(path, &meta).is_some_and(|key| self.shared.replay(path, &key, stats, on_detection))
         {
             return Ok(());
         }
@@ -312,22 +395,33 @@ impl Engine {
 
         // The verdict is stored under the key of the handle that is read, taken before reading: a file swapped
         // or changed meanwhile has a different id or marker, so it misses next time instead of inheriting this verdict.
-        let mut file = File::open(path)?;
-        let key = self.file_key(path, &file);
+        let file = File::open(path)?;
+        let key = self.shared.file_key(path, &file);
+        self.scan_open(path, file, key, stats, on_detection)
+    }
+
+    /// The tail shared by walked files and open handles: read → trust → engines → cache. `key` was taken from `file`.
+    fn scan_open(
+        &mut self,
+        path: &Path,
+        mut file: File,
+        key: Option<FileKey>,
+        stats: &mut Stats,
+        on_detection: &mut dyn FnMut(Detection),
+    ) -> io::Result<()> {
         let mut data = Vec::new();
         // take(): a file that grows after the size check still stops at the limit.
-        (&mut file).take(self.max_file_size).read_to_end(&mut data)?;
+        (&mut file).take(self.shared.sigs.max_file_size).read_to_end(&mut data)?;
         stats.scanned += 1;
 
         // ponytail: trust is only asked for executables; a signature check costs ~20 ms on Windows (more for
         // unsigned files), far more than scanning a small data file. Widen if FPs on signed non-PE files show up.
-        if self.trust_enabled && matches!(file_type(&data), FileType::Pe | FileType::Elf | FileType::Script) {
+        let executable = matches!(file_type(&data), FileType::Pe | FileType::Elf | FileType::Script);
+        if self.shared.sigs.trust_enabled && executable {
             let sha256: [u8; 32] = Sha256::digest(&data).into();
-            if self.platform.as_ref().is_some_and(|p| p.is_trusted(path, &file, &sha256)) {
+            if self.shared.platform.as_ref().is_some_and(|p| p.is_trusted(path, &file, &sha256)) {
                 stats.trusted += 1;
-                if let (Some(key), Some(cache)) = (key, &mut self.cache) {
-                    cache.put(key, Vec::new());
-                }
+                self.shared.put(key, Vec::new());
                 return Ok(());
             }
         }
@@ -339,7 +433,7 @@ impl Engine {
             on_detection(d);
         });
         // An incomplete scan (YARA error or timeout) is not cached, so the next scan retries it.
-        if let (Some(key), Some(cache), true) = (key, &mut self.cache, stats.errors == errors) {
+        if stats.errors == errors {
             let outer = path.display().to_string();
             let cached = found.into_iter().map(|d| cache::Cached {
                 inner: d.path.display().to_string().strip_prefix(&outer).unwrap_or_default().to_owned(),
@@ -348,14 +442,14 @@ impl Engine {
                 file_type: d.file_type,
                 sha256: d.sha256,
             });
-            cache.put(key, cached.collect());
+            self.shared.put(key, cached.collect());
         }
         Ok(())
     }
 
     /// Scans one file's contents, including everything nested inside it.
     fn scan_data(&mut self, path: &Path, data: &[u8], stats: &mut Stats, on_detection: &mut dyn FnMut(Detection)) {
-        let mut budget = archive::Budget::new(&self.archives);
+        let mut budget = archive::Budget::new(&self.shared.sigs.archives);
         self.scan_buffer(&path.display().to_string(), data, 0, &mut budget, stats, on_detection);
         stats.encrypted += budget.encrypted;
         stats.limit_hits += budget.limit_hit as u64;
@@ -375,7 +469,7 @@ impl Engine {
         let sha256: [u8; 32] = Sha256::digest(data).into();
         let file_type = file_type(data);
         let mut found: Vec<(&'static str, String)> = Vec::new();
-        if let Some(name) = self.hashes.get(&sha256) {
+        if let Some(name) = self.shared.sigs.hashes.get(&sha256) {
             found.push(("hash", name.clone()));
         }
         match self.yara.scan(data) {
@@ -398,12 +492,12 @@ impl Engine {
         if !archive::is_container(data) || budget.limit_hit {
             return;
         }
-        if depth >= self.archives.max_depth {
-            log::warn!("{path}: nested deeper than {} levels, not opened", self.archives.max_depth);
+        if depth >= self.shared.sigs.archives.max_depth {
+            log::warn!("{path}: nested deeper than {} levels, not opened", self.shared.sigs.archives.max_depth);
             budget.limit_hit = true;
             return;
         }
-        let max = self.max_file_size;
+        let max = self.shared.sigs.max_file_size;
         // A bad or bomb-like archive is logged, not counted as an error: the outer file itself was scanned.
         let result = archive::for_each_entry(data, max, budget, &mut |name, bytes, budget| {
             self.scan_buffer(&format!("{path}!{name}"), bytes, depth + 1, budget, stats, on_detection)

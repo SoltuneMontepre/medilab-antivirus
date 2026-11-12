@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use av_core::{FileKey, Platform, TrustConfig};
 
+pub mod fanotify;
+
 /// How often `is_trusted` looks at the rpmdb mtime to see whether packages changed.
 const RPMDB_RECHECK: Duration = Duration::from_secs(30);
 /// Current Fedora/RHEL first; older releases keep the rpmdb in /var/lib/rpm.
@@ -78,6 +80,53 @@ impl Platform for LinuxPlatform {
             None => std::fs::canonicalize(path).ok().and_then(|p| rpm.digests.get(&p).copied().flatten()),
         };
         recorded == Some(*sha256)
+    }
+}
+
+/// Raises niceness to 10 if it is lower, and sets the I/O class to idle. Both are per-thread on Linux:
+/// call before spawning threads so they inherit it.
+pub fn lower_priority() -> io::Result<()> {
+    const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+    const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+    // SAFETY: plain syscalls; errno is cleared first because getpriority can legitimately return -1.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+        if nice == -1 && *libc::__errno_location() != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if nice < 10 && libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Blocks SIGTERM and SIGINT in the calling thread and spawns a thread that waits for one, then runs `f`
+/// once. Call from main before spawning any thread, so every thread inherits the mask.
+pub fn on_terminate(f: impl FnOnce() + Send + 'static) {
+    // SAFETY: sigset_t is plain data, initialised by sigemptyset before use.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
+    let spawned = std::thread::Builder::new().name("signals".into()).spawn(move || {
+        let mut sig = 0;
+        // SAFETY: valid set and out pointer.
+        unsafe { libc::sigwait(&set, &mut sig) };
+        log::info!("signal {sig} received, shutting down");
+        f();
+    });
+    if let Err(e) = spawned {
+        log::error!("cannot spawn signal thread: {e}");
     }
 }
 
@@ -164,11 +213,11 @@ mod tests {
         Sha256::digest(data).into()
     }
 
-    /// Ubuntu CI has no rpm: trust tests skip there.
+    /// Ubuntu CI has an `rpm` binary but no rpm-owned files: trust tests skip unless rpm owns /usr/bin/ls.
     fn have_rpm() -> bool {
-        let ok = Command::new("rpm").arg("--version").output().is_ok_and(|o| o.status.success());
+        let ok = Command::new("rpm").args(["-qf", "/usr/bin/ls"]).output().is_ok_and(|o| o.status.success());
         if !ok {
-            eprintln!("rpm not available, skipping");
+            eprintln!("no rpm-managed system, skipping");
         }
         ok
     }

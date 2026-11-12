@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 av-core = { path = "../core" }
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -13,4 +14,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_System_Threading",
 ] }

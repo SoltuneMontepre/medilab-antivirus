@@ -33,4 +33,15 @@ jobs:
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\avd-fixtures" | Out-Null
           "AVD_FIXTURE_DIR=$env:RUNNER_TEMP\avd-fixtures" >> $env:GITHUB_ENV
       # --include-ignored: also run the on-disk EICAR test, ignored locally because it needs the exclusion.
-      - run: cargo test --workspace -- --include-ignored
+      # The real-time test needs admin/root; it runs in the next steps.
+      - run: cargo test --workspace -- --include-ignored --skip realtime_
+      # Windows runners are already admin (USN journal access).
+      - name: Real-time test
+        if: runner.os == 'Windows'
+        run: cargo test -p daemon --test realtime -- --include-ignored
+      # fanotify needs root. Build as the runner user, run only the test binary under sudo (no root-owned target files).
+      - name: Real-time test (root)
+        if: runner.os == 'Linux'
+        run: |
+          exe=$(cargo test -p daemon --test realtime --no-run --message-format=json | jq -r 'select(.target.name == "realtime" and .executable != null) | .executable')
+          sudo -E "$exe" --include-ignored

@@ -1,5 +1,5 @@
 # The single config file for the whole product. Every key is optional; the values below are the defaults.
-# Later milestones add sections: [watch], [actions], [updates].
+# Later milestones add sections: [actions], [updates].
 
 max_file_size = 67108864           # 64 MiB; larger files are skipped and counted
 hash_list = "signatures/hashes.txt"
@@ -22,3 +22,16 @@ max_ratio = 100                    # per-entry decompressed:compressed ratio (ch
 [trust]
 enabled = true
 publishers = ["Microsoft Windows", "Microsoft Corporation"]
+
+# Real-time protection (`avd run` / the service). Files written under `paths` are scanned once their writes have
+# been quiet for `debounce_ms`. The cache dir (and its avd.log) is always excluded.
+[watch]
+# Default: ['C:\Users'] on Windows, ['/home', '/tmp'] on Linux. Windows: NTFS volumes only.
+# paths = ['C:\Users', 'D:\Downloads']
+# Globs, case-insensitive on Windows. None by default: malware drops into build and package dirs too, so every
+# exclusion is a blind spot. Opt in only where the write volume hurts, for example:
+# exclude = ["**/target/**", "**/node_modules/**"]
+exclude = []
+debounce_ms = 500
+workers = 2                        # scan threads, each with its own YARA scanner
+queue = 10000                      # bounded queue; when full, paths wait in a deduplicated rescan-later set

@@ -9,10 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 av-core = { path = "../core" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 sensors-windows = { path = "../sensors-windows" }
+windows-service = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sensors-linux = { path = "../sensors-linux" }

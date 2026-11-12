@@ -1,0 +1,18 @@
+# Install: see README "Run as a service". Runs as root: fanotify needs CAP_SYS_ADMIN.
+[Unit]
+Description=avd antivirus (real-time file scanning)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/avd run -c /etc/avd/antivirus.toml
+Restart=on-failure
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+User=root
+AmbientCapabilities=CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target
