@@ -1,0 +1,17 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "avd"
+path = "src/main.rs"
+
+[dependencies]
+av-core = { path = "../core" }
+
+[target.'cfg(windows)'.dependencies]
+sensors-windows = { path = "../sensors-windows" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sensors-linux = { path = "../sensors-linux" }

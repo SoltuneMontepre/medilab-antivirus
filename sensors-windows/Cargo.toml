@@ -1,0 +1,7 @@
+[package]
+name = "sensors-windows"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+av-core = { path = "../core" }

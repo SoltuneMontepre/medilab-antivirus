@@ -1,0 +1,7 @@
+# Named av-core: a package called `core` would shadow Rust's built-in `core` crate.
+[package]
+name = "av-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
