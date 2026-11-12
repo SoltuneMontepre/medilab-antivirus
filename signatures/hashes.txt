@@ -1,0 +1,2 @@
+# SHA-256 hash list: one `<sha256 hex> <name>` per line. Lines starting with # and blank lines are ignored.
+275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f EICAR-Test-File

@@ -4,3 +4,21 @@
 max_file_size = 67108864           # 64 MiB; larger files are skipped and counted
 hash_list = "signatures/hashes.txt"
 rules_dir = "signatures/rules"
+# Verdict cache directory. Default: %ProgramData%/avd/cache or /var/lib/avd/cache when writable,
+# else %LOCALAPPDATA%/avd/cache or ~/.cache/avd/cache. Relative paths resolve against this file.
+# cache_dir = "cache"
+
+# Archive bomb limits, per top-level file. The first limit hit stops extraction of that file
+# (counted as `limit hits`); the scan continues with the next file.
+[archives]
+max_depth = 5                      # containers at depth < max_depth are opened (outer file = depth 0)
+max_entries = 10000                # entries extracted across all nesting levels
+max_total_bytes = 1073741824       # 1 GiB decompressed across all nesting levels
+max_ratio = 100                    # per-entry decompressed:compressed ratio (checked past 1 MiB)
+
+# Files that skip the engines. Only executables are checked (PE, ELF, scripts); results are cached.
+# Windows: valid Authenticode signature (embedded or catalog) whose signer is listed below; any other
+#   valid signature is NOT trusted. Linux: RPM-owned, non-%config, digest matches the rpmdb.
+[trust]
+enabled = true
+publishers = ["Microsoft Windows", "Microsoft Corporation"]

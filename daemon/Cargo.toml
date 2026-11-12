@@ -9,9 +9,13 @@ path = "src/main.rs"
 
 [dependencies]
 av-core = { path = "../core" }
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 sensors-windows = { path = "../sensors-windows" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sensors-linux = { path = "../sensors-linux" }
+
+[dev-dependencies]
+sha2 = "0.10"

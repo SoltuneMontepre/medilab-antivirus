@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 av-core = { path = "../core" }
+log = "0.4"
+
+[dev-dependencies]
+sha2 = "0.10"

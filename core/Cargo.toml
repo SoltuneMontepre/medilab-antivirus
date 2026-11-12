@@ -5,8 +5,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+flate2 = "1.1.11"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
+sevenz-rust2 = "0.25.0"
 sha2 = "0.10"
+tar = "0.4.46"
 toml = "0.8"
 walkdir = "2"
+yara-x = "1.23.0"
+# yara-x asks for rsa ^0.10.0-rc.19 but breaks on 0.10.0 final; pin until yara-x fixes it. Remove with it.
+rsa = "=0.10.0-rc.19"
+zip = "9.5.1"

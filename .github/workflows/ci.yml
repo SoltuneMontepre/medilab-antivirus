@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The EICAR integration test writes its fixture here; keep Defender from quarantining it.
+      - name: Defender exclusion for EICAR fixtures
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP\avd-fixtures"
+      - name: Fixture dir
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\avd-fixtures" | Out-Null
+          "AVD_FIXTURE_DIR=$env:RUNNER_TEMP\avd-fixtures" >> $env:GITHUB_ENV
+      # --include-ignored: also run the on-disk EICAR test, ignored locally because it needs the exclusion.
+      - run: cargo test --workspace -- --include-ignored
