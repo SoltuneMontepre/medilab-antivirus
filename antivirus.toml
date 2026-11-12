@@ -1,0 +1,6 @@
+# The single config file for the whole product. Every key is optional; the values below are the defaults.
+# Later milestones add sections: [watch], [actions], [updates].
+
+max_file_size = 67108864           # 64 MiB; larger files are skipped and counted
+hash_list = "signatures/hashes.txt"
+rules_dir = "signatures/rules"

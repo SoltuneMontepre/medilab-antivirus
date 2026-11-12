@@ -5,3 +5,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8"
+walkdir = "2"
