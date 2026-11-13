@@ -43,7 +43,7 @@ fn realtime_detects_debounces_and_blocks() {
     let rules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../signatures/rules");
     let config = dir.join("antivirus.toml");
     let toml = format!(
-        "hash_list = 'hashes.txt'\nrules_dir = '{}'\ncache_dir = 'cache'\n[watch]\npaths = ['{}']\ndebounce_ms = 1000\n",
+        "hash_list = 'hashes.txt'\nrules_dir = '{}'\ndata_dir = 'data'\n[watch]\npaths = ['{}']\ndebounce_ms = 1000\n",
         rules.display(),
         watched.display()
     );

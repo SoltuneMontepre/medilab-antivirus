@@ -13,7 +13,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use av_core::{FileKey, Platform, TrustConfig};
+use av_core::{FileKey, Platform, ProcessOp, TrustConfig};
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_PROCESS_MODE_ALREADY_BACKGROUND, HANDLE, TRUST_E_NOSIGNATURE,
@@ -39,7 +39,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, PROCESS_MODE_BACKGROUND_BEGIN};
 
+pub mod acl;
+pub mod response;
 pub mod usn;
+
+pub use acl::{lock_down, user_writable};
+pub use response::{notify, on_terminate};
 
 /// Background mode for the whole process: lowers its CPU, I/O and memory priority. Ok if already in it.
 pub fn lower_priority() -> io::Result<()> {
@@ -80,6 +85,14 @@ impl Platform for WindowsPlatform {
 
     fn is_trusted(&self, path: &Path, file: &File, _sha256: &[u8; 32]) -> bool {
         signer(path, file).is_some_and(|s| self.publishers.contains(&s))
+    }
+
+    fn process(&self, pid: u32, op: ProcessOp) -> io::Result<()> {
+        response::process(pid, op)
+    }
+
+    fn delete_on_reboot(&self, path: &Path) -> io::Result<()> {
+        response::delete_on_reboot(path)
     }
 
     fn dir_keys(&self, dir: &Path) -> Option<HashMap<OsString, FileKey>> {

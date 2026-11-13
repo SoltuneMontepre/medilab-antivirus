@@ -156,7 +156,7 @@ fn run(mut volume: Volume, cursor: Arc<Mutex<Cursor>>, pipeline: Arc<Pipeline>) 
         match volume.read(&mut buf) {
             Ok(paths) => {
                 failed = false;
-                paths.into_iter().for_each(|p| pipeline.push(p));
+                paths.into_iter().for_each(|p| pipeline.push(p, None)); // USN records carry no pid
             }
             Err(e) => {
                 log::warn!("{}: reading the USN journal: {e}; rescanning watched paths", volume.name);

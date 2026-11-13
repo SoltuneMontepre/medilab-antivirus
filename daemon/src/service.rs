@@ -31,8 +31,8 @@ pub fn dispatch(config: PathBuf) -> Result<(), String> {
 
 fn service_main(_: Vec<OsString>) {
     let config = CONFIG.get().expect("set by dispatch");
-    // Log next to the verdict cache: `<cache dir>\avd.log`, the previous one kept as avd.log.old past 10 MB.
-    let dir = av_core::Config::load(config).ok().and_then(|c| crate::cache_dir(&c));
+    // Log in the data dir: `<data dir>\avd.log`, the previous one kept as avd.log.old past 10 MB.
+    let dir = crate::load(config, true).ok().and_then(|c| c.data_dir);
     let file = dir.map(|d| d.join("avd.log")).and_then(|log| {
         if std::fs::metadata(&log).is_ok_and(|m| m.len() > LOG_ROTATE) {
             let _ = std::fs::rename(&log, log.with_extension("log.old"));
