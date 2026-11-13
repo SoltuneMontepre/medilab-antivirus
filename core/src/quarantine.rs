@@ -76,14 +76,8 @@ pub fn quarantine(
         return Err(e);
     }
 
-    // Windows refuses to delete a read-only file. (The lint is about Unix, where this would mean world-writable.)
-    #[cfg(windows)]
-    #[allow(clippy::permissions_set_readonly_false)]
-    if entry.readonly {
-        let mut writable = meta.permissions();
-        writable.set_readonly(false);
-        let _ = fs::set_permissions(file, writable);
-    }
+    // Permissions are never touched here (set_permissions follows symlinks, so a swapped-in link would aim the
+    // service's rights elsewhere). std's remove_file deletes read-only files on Windows by itself.
     match fs::remove_file(file) {
         Ok(()) => Ok(Quarantined { id, at_reboot: false }),
         // ERROR_SHARING_VIOLATION: a running process holds it open.
@@ -95,7 +89,6 @@ pub fn quarantine(
             Ok(Quarantined { id, at_reboot: true })
         }
         Err(e) => {
-            let _ = fs::set_permissions(file, meta.permissions());
             cleanup();
             Err(io::Error::new(e.kind(), format!("cannot delete the original: {e}")))
         }
