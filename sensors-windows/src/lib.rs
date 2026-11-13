@@ -15,7 +15,10 @@ use std::ptr::{null, null_mut};
 
 use av_core::{FileKey, Platform, TrustConfig};
 use windows_sys::core::PCWSTR;
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_FORM_UNKNOWN};
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, ERROR_PROCESS_MODE_ALREADY_BACKGROUND, HANDLE, TRUST_E_NOSIGNATURE,
+    TRUST_E_SUBJECT_FORM_UNKNOWN,
+};
 use windows_sys::Win32::Security::Cryptography::Catalog::{
     CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2, CryptCATAdminEnumCatalogFromHash,
     CryptCATAdminReleaseCatalogContext, CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
@@ -34,6 +37,21 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, PROCESS_MODE_BACKGROUND_BEGIN};
+
+pub mod usn;
+
+/// Background mode for the whole process: lowers its CPU, I/O and memory priority. Ok if already in it.
+pub fn lower_priority() -> io::Result<()> {
+    // SAFETY: the pseudo-handle from GetCurrentProcess needs no closing.
+    if unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) } == 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(ERROR_PROCESS_MODE_ALREADY_BACKGROUND as i32) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
 
 pub struct WindowsPlatform {
     publishers: Vec<String>,
@@ -319,6 +337,12 @@ mod tests {
     }
 
     #[test]
+    fn lower_priority_ok() {
+        lower_priority().unwrap();
+        lower_priority().unwrap(); // already in background mode
+    }
+
+    #[test]
     fn notepad_is_catalog_signed_by_microsoft_windows() {
         let file = File::open(NOTEPAD).unwrap();
         let name = signer(Path::new(NOTEPAD), &file);
@@ -458,7 +482,10 @@ mod tests {
     #[test]
     #[ignore = "benchmark; needs AVD_TREE"]
     fn dir_keys_timing() {
-        let root = std::path::PathBuf::from(std::env::var_os("AVD_TREE").expect("set AVD_TREE"));
+        let Some(root) = std::env::var_os("AVD_TREE").map(std::path::PathBuf::from) else {
+            println!("skipped: set AVD_TREE");
+            return;
+        };
         let mut dirs = vec![root];
         let mut i = 0;
         while i < dirs.len() {
