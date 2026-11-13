@@ -1,12 +1,14 @@
 # The single config file for the whole product. Every key is optional; the values below are the defaults.
-# Later milestones add sections: [actions], [updates].
+# Later milestones add sections: [updates].
 
 max_file_size = 67108864           # 64 MiB; larger files are skipped and counted
 hash_list = "signatures/hashes.txt"
 rules_dir = "signatures/rules"
-# Verdict cache directory. Default: %ProgramData%/avd/cache or /var/lib/avd/cache when writable,
-# else %LOCALAPPDATA%/avd/cache or ~/.cache/avd/cache. Relative paths resolve against this file.
-# cache_dir = "cache"
+# avd's own state: verdict cache, quarantine/, detections.jsonl, allowed.txt, avd.log (service), USN cursors.
+# Default: %ProgramData%/avd or /var/lib/avd when writable, else %LOCALAPPDATA%/avd or ~/.local/share/avd.
+# Relative paths resolve against this file. The service restricts it to admins / root.
+# data_dir = "data"
+notify = true                      # desktop notification per detection (real-time only), at most one per 10 s
 
 # Archive bomb limits, per top-level file. The first limit hit stops extraction of that file
 # (counted as `limit hits`); the scan continues with the next file.
@@ -24,7 +26,7 @@ enabled = true
 publishers = ["Microsoft Windows", "Microsoft Corporation"]
 
 # Real-time protection (`avd run` / the service). Files written under `paths` are scanned once their writes have
-# been quiet for `debounce_ms`. The cache dir (and its avd.log) is always excluded.
+# been quiet for `debounce_ms`. The data dir is always excluded.
 [watch]
 # Default: ['C:\Users'] on Windows, ['/home', '/tmp'] on Linux. Windows: NTFS volumes only.
 # paths = ['C:\Users', 'D:\Downloads']
@@ -35,3 +37,13 @@ exclude = []
 debounce_ms = 500
 workers = 2                        # scan threads, each with its own YARA scanner
 queue = 10000                      # bounded queue; when full, paths wait in a deduplicated rescan-later set
+
+# What happens to a detected file: `default`, or per engine (`hash`, `yara`). Each action includes the ones before:
+#   alert       log it (detections.jsonl) and notify
+#   quarantine  also move the file into <data_dir>/quarantine (`avd quarantine list`, `avd restore <id>`)
+#   suspend     also suspend the process that wrote it, when known (Linux only for now: `avd process resume|kill`)
+#   kill        also kill that process
+# Applies to `avd scan` too. Keep `alert` until the detection log shows no false positives for an engine.
+[actions]
+default = "alert"
+# hash = "quarantine"

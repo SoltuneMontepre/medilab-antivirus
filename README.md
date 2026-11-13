@@ -20,22 +20,25 @@ Exit codes, the same as ClamAV: `0` clean, `1` detections found, `2` error.
 `avd run [-c antivirus.toml]` watches the `[watch]` paths in the foreground (default `C:\Users` on Windows, `/home` and `/tmp` on Linux).
 Each written file is scanned once its writes have been quiet for `debounce_ms`; most rescans of unchanged files are verdict-cache hits.
 Two worker threads scan at background CPU and I/O priority. Logs are timestamped `LEVEL message` lines on stderr; a detection is one line:
-`detection  path  engine  name  file type` (tab-separated, level `WARN`).
+`detection  path  engine  name  file type  action: result` (tab-separated).
 
 Changes made while avd is down are caught up at the next start: Windows replays the USN journal from the saved cursor; Linux rescans the watched paths.
 
 ### Run as a service
 
-Windows, from an admin terminal (the service runs as LocalSystem, delayed auto-start, and restarts after 5 s / 30 s / 60 s on failure):
+Windows, from an admin terminal. Program Files is admin-only, so other programs can't edit the exe, config or rules
+(avd warns at startup when they can). The service runs as LocalSystem, delayed auto-start, and restarts after 5 s / 30 s / 60 s on failure:
 
 ```powershell
-target\release\avd install -c C:\path\to\antivirus.toml   # registers and starts the "avd" service; keep the exe and config where they are
-target\release\avd uninstall                              # stops and removes it
+$d = "$env:ProgramFiles\avd"; mkdir $d -Force
+copy target\release\avd.exe, antivirus.toml $d; copy -Recurse -Force signatures $d
+& "$d\avd.exe" install -c "$d\antivirus.toml"   # registers and starts the "avd" service
+& "$d\avd.exe" uninstall                        # stops and removes it
 ```
 
-The service logs to `avd.log` in the cache directory (`%ProgramData%\avd\cache\avd.log` by default); a log over 10 MB is moved to `avd.log.old` at start.
+The service logs to `avd.log` in the data directory (`%ProgramData%\avd\avd.log` by default); a log over 10 MB is moved to `avd.log.old` at start.
 
-Linux (systemd, runs as root):
+Linux (systemd, runs as root, restarts 5 s after a failure):
 
 ```sh
 sudo install -m 755 target/release/avd /usr/local/bin/avd
@@ -45,13 +48,49 @@ sudo systemctl daemon-reload && sudo systemctl enable --now avd
 journalctl -u avd -f
 ```
 
+## Response
+
+What happens to a detected file is set per engine in `[actions]`: `alert` (default), `quarantine`, `suspend` or `kill`, each
+including the ones before it. It applies to `avd scan` and to real-time protection. Keep `alert` until the detection log has
+shown no false positives for an engine during normal use; [docs/false-positives.md](docs/false-positives.md) is the procedure and record.
+
+- **Detection log**: one JSON line per detection in `<data dir>/detections.jsonl` (time, path, sha256, file type, engine, rule,
+  pid, action, action result, quarantine id); rotated at 10 MB, 5 old files kept. `avd detections [--since 24h]` prints recent ones.
+- **Quarantine**: the file is copied, XOR-neutered, to `<data dir>/quarantine/<id>.bin` with an `<id>.json` sidecar (original
+  path, sha256, size, time, detections, permissions). Both are fsynced before the original is deleted, so a failure leaves the
+  original in place. A file another process holds open (Windows) is deleted at the next reboot.
+  `avd quarantine list` shows entries; `avd restore <id> [--to <path>] [--force] [--allow]` writes the file back after checking
+  its hash. `--allow` adds the hash to `<data dir>/allowed.txt`, so a false positive is not detected again (picked up live by the service).
+  `avd allow <file>` does the same for a file that was left in place (alert mode).
+- **Processes**: `suspend` / `kill` act on the process that wrote the file. Only Linux knows it today (fanotify);
+  elsewhere these fall back to quarantine. pid 0/1/4, kernel threads, critical Windows processes and avd itself are refused.
+  `avd process resume|kill <pid>` decides about a suspended one.
+- **Notifications**: real-time detections pop up on every logged-in user's desktop (Windows: a message box from the service;
+  Linux: `notify-send` in each graphical session, run as that user, never through a shell). At most one per 10 s; the
+  rest roll up into "…and N more". `notify = false` turns them off.
+
+The data directory is `%ProgramData%\avd` / `/var/lib/avd` (or `data_dir` in the config). The service restricts it to
+SYSTEM and Administrators (Windows) or mode 0700 (Linux). Commands run by a non-admin user fall back to their own
+`%LOCALAPPDATA%\avd` / `~/.local/share/avd`.
+
+### Self-protection
+
+At startup the service:
+
+- warns (log and notification) if non-admin users can modify the config, the hash list or the rules, or their directories
+- logs what changed in the config since the last start, and notifies when protection got weaker: new exclusions, fewer watched
+  paths, weaker actions, new trusted publishers, notifications off
+- notifies if the previous run stopped without a clean shutdown (a heartbeat file is updated every minute)
+
+None of this stops malware running as admin or root: it can still stop avd or edit its files. It makes that noticed.
+
 ### Known limitations
 
 - Windows: needs admin (reads the NTFS USN journal). Only NTFS volumes are watched; FAT/exFAT sticks and network shares are not.
   Detection happens after the write: a dropped file can run before its scan finishes. Nothing is blocked.
+  USN records carry no process, so `suspend` / `kill` can't find the writer yet (ETW in M5).
 - Linux: needs `CAP_SYS_ADMIN` (fanotify). Executing a watched file waits for a cached verdict or a scan; a scan that takes longer than
   300 ms lets the exec through and the file is scanned afterwards. If avd dies, the kernel allows any pending exec.
-- Detections are only logged for now; quarantine and other actions arrive in M4.
 
 ## Benchmark tree
 

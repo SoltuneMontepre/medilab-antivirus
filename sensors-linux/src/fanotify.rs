@@ -61,7 +61,7 @@ pub fn watch_writes(roots: &[PathBuf], pipeline: Arc<Pipeline>) -> io::Result<()
                 // replace); exec checks scan the event fd. Holding fds in the debouncer would exhaust them.
                 if let Some(file) = file.filter(|_| meta.pid != me) {
                     match fd_path(&file) {
-                        Ok(path) => pipeline.push(path),
+                        Ok(path) => pipeline.push(path, u32::try_from(meta.pid).ok()),
                         Err(e) => log::warn!("fanotify: cannot resolve event path: {e}"),
                     }
                 }
@@ -375,8 +375,8 @@ mod tests {
         let (found_tx, found) = mpsc::channel();
         let worker = pipeline.clone();
         std::thread::spawn(move || {
-            worker.work(&mut av_core::Engine::new(shared), &|d| {
-                let _ = found_tx.send(d.path);
+            worker.work(&mut av_core::Engine::new(shared), &|found, _| {
+                let _ = found_tx.send(found[0].path.clone());
             })
         });
         watch_writes(std::slice::from_ref(&watched), pipeline.clone()).unwrap();

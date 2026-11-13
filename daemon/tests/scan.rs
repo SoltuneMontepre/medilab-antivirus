@@ -48,7 +48,7 @@ fn rescan_hits_cache_and_replays_detections() {
     std::fs::write(dir.join("hashes.txt"), format!("{hex} Test-Marked\n")).unwrap();
     let rules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../signatures/rules");
     let config = dir.join("antivirus.toml");
-    let toml = format!("hash_list = 'hashes.txt'\nrules_dir = '{}'\ncache_dir = 'cache'\n", rules.display());
+    let toml = format!("hash_list = 'hashes.txt'\nrules_dir = '{}'\ndata_dir = 'data'\n", rules.display());
     std::fs::write(&config, toml).unwrap();
 
     let (code, _, s) = avd(&tree, &config);
@@ -61,6 +61,49 @@ fn rescan_hits_cache_and_replays_detections() {
     let (_, _, s) = avd(&tree, &config);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!((s("scanned"), s("cache hits")), (1, 20));
+}
+
+/// M4: a detected file is quarantined (one detection-log line per detection) and restored byte-identical.
+#[test]
+fn quarantine_then_restore_byte_identical() {
+    use sha2::{Digest, Sha256};
+    let dir = std::env::temp_dir().join(format!("avd-quarantine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let marked = b"harmless, but listed";
+    let file = tree.join("marked.bin");
+    std::fs::write(&file, marked).unwrap();
+    let hex: String = Sha256::digest(marked).iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.join("hashes.txt"), format!("{hex} Test-Marked\n")).unwrap();
+    let rules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../signatures/rules");
+    let config = dir.join("antivirus.toml");
+    let toml = format!(
+        "hash_list = 'hashes.txt'\nrules_dir = '{}'\ndata_dir = 'data'\n[actions]\nhash = 'quarantine'\n",
+        rules.display()
+    );
+    std::fs::write(&config, toml).unwrap();
+    let avd_cmd = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_avd")).args(args).arg("-c").arg(&config).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    let (code, _, _) = avd(&tree, &config);
+    assert_eq!(code, Some(1));
+    assert!(!file.exists(), "detected file still in place");
+    let log = std::fs::read_to_string(dir.join("data/detections.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains(r#""action":"quarantine","action_result":"quarantined""#), "{log}");
+
+    let (code, list) = avd_cmd(&["quarantine", "list"]);
+    assert_eq!(code, Some(0));
+    let id = list.split('\t').next().unwrap().to_owned();
+    assert_eq!(avd_cmd(&["restore", &id]).0, Some(0));
+    let restored = std::fs::read(&file).unwrap();
+    let (_, after) = avd_cmd(&["quarantine", "list"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(restored, marked);
+    assert_eq!(after, "");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use std::io::{Cursor, Read};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The ratio check only kicks in past this many decompressed bytes, so tiny entries never trip it.
 const RATIO_FLOOR: u64 = 1 << 20;
@@ -12,7 +12,7 @@ const SEVENZ_MEM_LIMIT_KB: usize = 256 * 1024;
 const ISO_MAX_DEPTH: u32 = 32;
 
 /// `[archives]`: archive bomb limits, all per top-level file.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Limits {
     /// Containers at depth < `max_depth` are opened (outer file = depth 0).

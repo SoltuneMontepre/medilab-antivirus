@@ -10,11 +10,16 @@ log = "0.4"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
     "Win32_System_Ioctl",
+    "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }

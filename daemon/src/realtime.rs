@@ -1,4 +1,4 @@
-//! `avd run`: sensors → watch pipeline → worker pool, with periodic checkpoints until told to stop.
+//! `avd run`: sensors → watch pipeline → worker pool → responder, with periodic checkpoints until told to stop.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -6,18 +6,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use av_core::response::Responder;
 use av_core::watch::{Filter, Pipeline};
-use av_core::{Config, Detection, Engine};
+use av_core::Engine;
 
 const CHECKPOINT: Duration = Duration::from_secs(60);
 
-fn report(d: Detection) {
-    log::warn!("detection\t{}\t{}\t{}\t{:?}", d.path.display(), d.engine, d.name, d.file_type);
-}
-
 /// Runs until `stop` receives (or its sender is dropped). Startup errors are returned; later ones are logged.
 pub fn run(config_path: &Path, stop: Receiver<()>) -> Result<(), String> {
-    let config = Config::load(config_path)?;
+    let config = crate::load(config_path, true)?;
     // Before any thread exists, so every worker inherits the low CPU and I/O priority.
     #[cfg(windows)]
     let lowered = sensors_windows::lower_priority();
@@ -28,16 +25,29 @@ pub fn run(config_path: &Path, stop: Receiver<()>) -> Result<(), String> {
         log::warn!("could not lower process priority: {e}");
     }
 
-    let dir = crate::cache_dir(&config);
-    let mut shared = crate::shared(&config, dir.as_deref())?;
+    let notifier = config.notify.then(crate::notify::start);
+    let alert = |message: String| {
+        log::warn!("{}", message.replace('\n', " "));
+        if let Some(n) = &notifier {
+            n.send(message);
+        }
+    };
+    let dir = config.data_dir.clone();
+    if let Some(dir) = &dir {
+        crate::protect::startup(&config, config_path, dir, &alert);
+    }
+
+    let mut shared = crate::shared(&config)?;
+    let notify = notifier.clone().map(|n| Box::new(move |m| n.send(m)) as Box<dyn Fn(String) + Send + Sync>);
+    let responder = Arc::new(Responder::new(&config, shared.platform.clone(), notify));
     let filter = Arc::new(Filter::new(&config.watch, dir.as_slice())?);
     shared.filter = Some(filter.clone());
     let pipeline = Pipeline::new(&config.watch, filter.clone());
     for i in 0..config.watch.workers.max(1) {
-        let (shared, pipeline) = (shared.clone(), pipeline.clone());
+        let (shared, pipeline, responder) = (shared.clone(), pipeline.clone(), responder.clone());
         thread::Builder::new()
             .name(format!("scan-{i}"))
-            .spawn(move || pipeline.work(&mut Engine::new(shared), &report))
+            .spawn(move || pipeline.work(&mut Engine::new(shared), &|found, pid| responder.respond(found, pid)))
             .map_err(|e| format!("worker thread: {e}"))?;
     }
     let roots = filter.roots();
@@ -79,16 +89,17 @@ pub fn run(config_path: &Path, stop: Receiver<()>) -> Result<(), String> {
             clean
         };
         let late = pipeline.clone();
-        let jobs = fanotify::guard_exec(roots, Duration::from_millis(300), quick, move |p| late.push(p))
+        let jobs = fanotify::guard_exec(roots, Duration::from_millis(300), quick, move |p| late.push(p, None))
             .map_err(|e| format!("fanotify (exec): {e}"))?;
-        let shared = shared.clone();
+        let (shared, responder) = (shared.clone(), responder.clone());
         thread::Builder::new()
             .name("exec".into())
             .spawn(move || {
                 let mut engine = Engine::new(shared);
                 for job in jobs {
+                    let mut found = Vec::new();
                     // A dup of the event fd: the job keeps its own until answered.
-                    let scan = || job.file.try_clone().map(|f| engine.scan_handle(&job.path, f, report));
+                    let scan = || job.file.try_clone().map(|f| engine.scan_handle(&job.path, f, |d| found.push(d)));
                     // An error or a panic allows the exec (fail open, like the deadline) and keeps this thread alive.
                     let allow = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(scan)) {
                         Ok(Ok(stats)) => stats.detections == 0,
@@ -101,10 +112,14 @@ pub fn run(config_path: &Path, stop: Receiver<()>) -> Result<(), String> {
                             true
                         }
                     };
-                    if !allow {
-                        log::warn!("blocked exec of {}", job.path.display());
-                    }
+                    let path = job.path.clone();
+                    // Answer first: the exec waits on it, and acting (quarantine, fsync) can take longer than the
+                    // deadline. The exec is blocked, so no process action: the caller only tried to run the file.
                     job.answer(allow);
+                    if !allow {
+                        log::warn!("blocked exec of {}", path.display());
+                        responder.respond(&found, None);
+                    }
                 }
             })
             .map_err(|e| format!("exec thread: {e}"))?;
@@ -116,12 +131,18 @@ pub fn run(config_path: &Path, stop: Receiver<()>) -> Result<(), String> {
         let stopping = !matches!(stop.recv_timeout(CHECKPOINT), Err(RecvTimeoutError::Timeout));
         checkpoint_cursors();
         crate::save_cache(&shared);
+        if let Some(dir) = &dir {
+            crate::protect::heartbeat(dir);
+        }
         if stopping {
             break;
         }
     }
     // Sensor threads stay blocked in their reads; the process exits right after this returns.
     pipeline.stop();
+    if let Some(dir) = &dir {
+        crate::protect::clean_stop(dir);
+    }
     log::info!("stopped");
     Ok(())
 }

@@ -3,6 +3,8 @@
 
 pub mod archive;
 pub mod cache;
+pub mod quarantine;
+pub mod response;
 pub mod watch;
 
 use std::collections::HashMap;
@@ -13,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 /// Contents of `antivirus.toml`. Every key has a default, so a missing file or key is fine.
-#[derive(Debug, Clone, Deserialize)]
+/// Serialize: the daemon keeps a snapshot of the effective config to log what changed between starts.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub max_file_size: u64,
@@ -26,9 +29,13 @@ pub struct Config {
     pub rules_dir: PathBuf,
     pub trust: TrustConfig,
     pub archives: archive::Limits,
-    /// Where the verdict cache lives. None = per-OS default chosen by the daemon.
-    pub cache_dir: Option<PathBuf>,
+    /// avd's own state: verdict cache, quarantine, detection log, allowlist. None = per-OS default, chosen and
+    /// filled in by the daemon before loading. Without one nothing is cached, allowed or quarantined.
+    pub data_dir: Option<PathBuf>,
     pub watch: watch::WatchConfig,
+    pub actions: response::Actions,
+    /// A desktop notification per detection (real-time protection only).
+    pub notify: bool,
 }
 
 impl Default for Config {
@@ -39,14 +46,16 @@ impl Default for Config {
             rules_dir: "signatures/rules".into(),
             trust: TrustConfig::default(),
             archives: archive::Limits::default(),
-            cache_dir: None,
+            data_dir: None,
             watch: watch::WatchConfig::default(),
+            actions: response::Actions::default(),
+            notify: true,
         }
     }
 }
 
 /// `[trust]`: which files may skip the engines.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrustConfig {
     /// Off = scan everything (for debugging).
@@ -78,6 +87,15 @@ pub trait Platform: Send + Sync {
     /// True only when the file is known-good (allowlisted signer, unmodified package file).
     /// `sha256` is the file's content digest, already computed by core.
     fn is_trusted(&self, path: &Path, file: &File, sha256: &[u8; 32]) -> bool;
+    /// Suspends, resumes or kills a process. Must refuse pid 0/1/4, kernel threads, critical system processes
+    /// and avd itself.
+    fn process(&self, _pid: u32, _op: ProcessOp) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Deletes `path` at the next reboot (Windows: a file another process holds open can't be deleted now).
+    fn delete_on_reboot(&self, _path: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// Optional fast path: keys for the regular files directly inside `dir`, by file name, from one directory
     /// read instead of one open per file (an open costs ~50 µs on Windows). Only used to look up the cache;
     /// on a miss the file is opened and re-keyed from the handle that is read. Must equal `file_key` for the
@@ -85,6 +103,13 @@ pub trait Platform: Send + Sync {
     fn dir_keys(&self, _dir: &Path) -> Option<HashMap<OsString, FileKey>> {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOp {
+    Suspend,
+    Resume,
+    Kill,
 }
 
 impl Config {
@@ -99,13 +124,13 @@ impl Config {
         if let Some(dir) = path.parent() {
             config.hash_list = dir.join(&config.hash_list);
             config.rules_dir = dir.join(&config.rules_dir);
-            config.cache_dir = config.cache_dir.map(|c| dir.join(c));
+            config.data_dir = config.data_dir.map(|c| dir.join(c));
         }
         Ok(config)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FileType {
     Pe,
     Elf,
@@ -132,7 +157,10 @@ pub fn file_type(data: &[u8]) -> FileType {
 
 #[derive(Debug, Clone)]
 pub struct Detection {
+    /// What matched: the file, or `file!inner/entry` inside a container.
     pub path: PathBuf,
+    /// The file on disk that `path` is in; actions apply to it.
+    pub file: PathBuf,
     pub sha256: [u8; 32],
     pub engine: &'static str,
     pub name: String,
@@ -178,6 +206,35 @@ struct Signatures {
     hashes: HashMap<[u8; 32], String>,
     rules: &'static yara_x::Rules,
     ruleset: [u8; 32],
+    /// `<data_dir>/allowed.txt`: hashes released by `avd restore --allow`.
+    allowed: Option<AllowList>,
+}
+
+/// Same format as the hash list; a matching file (contents included) is never detected. Re-read when it changes,
+/// so a running daemon honours an allow made by another process. Not part of the ruleset fingerprint: cached
+/// detections are filtered against it on replay instead.
+type Hashes = HashMap<[u8; 32], String>;
+
+struct AllowList {
+    path: PathBuf,
+    /// (mtime at the last load, hashes).
+    state: Mutex<(Option<std::time::SystemTime>, Hashes)>,
+}
+
+impl AllowList {
+    /// One stat; reloads if the mtime changed. Missing file = nothing allowed.
+    fn refresh(&self) {
+        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mut state = lock(&self.state);
+        if state.0 != mtime {
+            let hashes = mtime.and_then(|_| load_hashes(&self.path, &mut Sha256::new()).ok());
+            *state = (mtime, hashes.unwrap_or_default());
+        }
+    }
+
+    fn contains(&self, sha256: &[u8; 32]) -> bool {
+        lock(&self.state).1.contains_key(sha256)
+    }
 }
 
 /// Everything an engine needs except its YARA scanner (which is tied to one thread). Cheap to clone; clone it into
@@ -202,6 +259,11 @@ impl Shared {
         let hashes = load_hashes(&config.hash_list, &mut ruleset)?;
         // ponytail: Rules are leaked so every Scanner can be 'static; each reload leaks the old set.
         let rules: &'static yara_x::Rules = Box::leak(Box::new(compile_rules(&config.rules_dir, &mut ruleset)?));
+        let allowed = config.data_dir.as_ref().map(|dir| {
+            let list = AllowList { path: dir.join("allowed.txt"), state: Mutex::default() };
+            list.refresh();
+            list
+        });
         let sigs = Signatures {
             max_file_size: config.max_file_size,
             archives: config.archives,
@@ -209,6 +271,7 @@ impl Shared {
             hashes,
             rules,
             ruleset: ruleset.finalize().into(),
+            allowed,
         };
         Ok(Shared { sigs: Arc::new(sigs), platform: None, cache: None, filter: None })
     }
@@ -236,15 +299,23 @@ impl Shared {
         }
     }
 
-    /// The cached verdict for `key` as detections at `path`; None on a miss.
+    fn allowed(&self, sha256: &[u8; 32]) -> bool {
+        self.sigs.allowed.as_ref().is_some_and(|a| a.contains(sha256))
+    }
+
+    /// The cached verdict for `key` as detections at `path`; None on a miss. Allowed hashes are dropped.
+    // ponytail: only the matched content's hash is checked, so a cached detection inside an archive whose outer
+    // hash was allowed replays until the archive changes; store the outer hash in the cache if that matters.
     fn cached(&self, path: &Path, key: &FileKey) -> Option<Vec<Detection>> {
         let mut cache = lock(self.cache.as_ref()?);
         cache
             .get(key)?
             .iter()
+            .filter(|c| !self.allowed(&c.sha256))
             .map(|c| {
                 Some(Detection {
                     path: format!("{}{}", path.display(), c.inner).into(),
+                    file: path.to_owned(),
                     sha256: c.sha256,
                     engine: ENGINES.into_iter().find(|e| *e == c.engine)?,
                     name: c.name.clone(),
@@ -335,6 +406,22 @@ impl Engine {
                 log::warn!("{}: {e}", path.display());
                 stats.errors += 1;
             }
+        }
+        stats
+    }
+
+    /// `scan`, with each file's detections handed over together (actions are taken once per file).
+    pub fn scan_grouped(&mut self, root: &Path, mut on_file: impl FnMut(&[Detection])) -> Stats {
+        let mut batch: Vec<Detection> = Vec::new();
+        let stats = self.scan(root, |d| {
+            if batch.first().is_some_and(|b| b.file != d.file) {
+                on_file(&batch);
+                batch.clear();
+            }
+            batch.push(d);
+        });
+        if !batch.is_empty() {
+            on_file(&batch);
         }
         stats
     }
@@ -449,6 +536,10 @@ impl Engine {
 
     /// Scans one file's contents, including everything nested inside it.
     fn scan_data(&mut self, path: &Path, data: &[u8], stats: &mut Stats, on_detection: &mut dyn FnMut(Detection)) {
+        if let Some(allowed) = &self.shared.sigs.allowed {
+            allowed.refresh();
+        }
+        let on_detection = &mut |d: Detection| on_detection(Detection { file: path.to_owned(), ..d });
         let mut budget = archive::Budget::new(&self.shared.sigs.archives);
         self.scan_buffer(&path.display().to_string(), data, 0, &mut budget, stats, on_detection);
         stats.encrypted += budget.encrypted;
@@ -467,6 +558,9 @@ impl Engine {
         on_detection: &mut dyn FnMut(Detection),
     ) {
         let sha256: [u8; 32] = Sha256::digest(data).into();
+        if self.shared.allowed(&sha256) {
+            return; // released by the user (`avd restore --allow`), contents included
+        }
         let file_type = file_type(data);
         let mut found: Vec<(&'static str, String)> = Vec::new();
         if let Some(name) = self.shared.sigs.hashes.get(&sha256) {
@@ -481,7 +575,8 @@ impl Engine {
         }
         for (engine, name) in found {
             stats.detections += 1;
-            on_detection(Detection { path: path.into(), sha256, engine, name, file_type });
+            // `file` is filled in by scan_data, which knows the file on disk.
+            on_detection(Detection { path: path.into(), file: PathBuf::new(), sha256, engine, name, file_type });
         }
 
         // RAR: no maintained pure-Rust decoder, so it is counted, not opened.

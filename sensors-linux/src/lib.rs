@@ -12,9 +12,24 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use av_core::{FileKey, Platform, TrustConfig};
+use av_core::{FileKey, Platform, ProcessOp, TrustConfig};
 
 pub mod fanotify;
+pub mod response;
+
+pub use response::notify;
+
+/// Self-protection: owner-only access (0700) to avd's data directory.
+pub fn lock_down(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// True if someone other than root may change `path`: not owned by root, or group/world writable.
+pub fn user_writable(path: &Path) -> io::Result<bool> {
+    let m = std::fs::metadata(path)?;
+    Ok(m.uid() != 0 || m.mode() & 0o022 != 0)
+}
 
 /// How often `is_trusted` looks at the rpmdb mtime to see whether packages changed.
 const RPMDB_RECHECK: Duration = Duration::from_secs(30);
@@ -80,6 +95,10 @@ impl Platform for LinuxPlatform {
             None => std::fs::canonicalize(path).ok().and_then(|p| rpm.digests.get(&p).copied().flatten()),
         };
         recorded == Some(*sha256)
+    }
+
+    fn process(&self, pid: u32, op: ProcessOp) -> io::Result<()> {
+        response::process(pid, op)
     }
 }
 

@@ -8,12 +8,12 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use globset::{Candidate, GlobBuilder, GlobSet, GlobSetBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{lock, Detection, Engine};
 
 /// `[watch]`: what real-time protection watches.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WatchConfig {
     pub paths: Vec<PathBuf>,
@@ -95,11 +95,11 @@ impl Filter {
 const LATER_CAP: usize = 100_000;
 
 struct State {
-    /// Debouncing: path → last event.
-    pending: HashMap<PathBuf, Instant>,
+    /// Debouncing: path → (last event, pid of the last writer when the sensor knows it).
+    pending: HashMap<PathBuf, (Instant, Option<u32>)>,
     /// Settled, waiting for a worker. At most `cap` long.
-    queue: VecDeque<PathBuf>,
-    /// Settled while the queue was full.
+    queue: VecDeque<(PathBuf, Option<u32>)>,
+    /// Settled while the queue was full. The writer pid is dropped here: by then it is likely stale.
     later: HashSet<PathBuf>,
     /// Workers currently scanning.
     busy: usize,
@@ -139,8 +139,8 @@ impl Pipeline {
     }
 
     /// Sensor entry point. Never blocks (only a short mutex). Drops paths the filter doesn't want.
-    /// Directories are fine (a worker walks them).
-    pub fn push(&self, path: PathBuf) {
+    /// Directories are fine (a worker walks them). `pid`: the writing process, if the sensor knows it.
+    pub fn push(&self, path: PathBuf, pid: Option<u32>) {
         if !self.filter.wants(&path) {
             return;
         }
@@ -148,12 +148,12 @@ impl Pipeline {
         if s.pending.len() >= self.cap && !s.pending.contains_key(&path) {
             // ponytail: the issue says flush the oldest pending path; queueing the newcomer undebounced is O(1)
             // and only loses debouncing under an event flood.
-            self.enqueue(&mut s, path);
+            self.enqueue(&mut s, path, pid);
             self.work.notify_one();
             return;
         }
         let was_empty = s.pending.is_empty();
-        s.pending.insert(path, Instant::now());
+        s.pending.insert(path, (Instant::now(), pid));
         // Otherwise the debouncer is already timed-waiting for an earlier deadline.
         if was_empty {
             self.settle.notify_one();
@@ -164,7 +164,7 @@ impl Pipeline {
     pub fn rescan(&self) {
         let mut s = lock(&self.state);
         for root in self.filter.roots() {
-            self.enqueue(&mut s, root.clone());
+            self.enqueue(&mut s, root.clone(), None);
         }
         self.work.notify_all();
     }
@@ -176,9 +176,10 @@ impl Pipeline {
     }
 
     /// Worker loop: scans queued paths with `engine` until stop(). One call per worker thread, each with its own Engine.
-    pub fn work(&self, engine: &mut Engine, on_detection: &(dyn Fn(Detection) + Sync)) {
+    /// `on_file` gets each file's detections together, plus the writer's pid when known.
+    pub fn work(&self, engine: &mut Engine, on_file: &(dyn Fn(&[Detection], Option<u32>) + Sync)) {
         loop {
-            let path = {
+            let (path, pid) = {
                 let mut s = lock(&self.state);
                 loop {
                     if s.stop {
@@ -186,18 +187,18 @@ impl Pipeline {
                     }
                     // ponytail: HashSet iter().next() rescans emptied buckets, O(n²/16) to drain a full `later`;
                     // fine at 100k, swap for an IndexSet if it shows in profiles.
-                    let next = s.queue.pop_front().or_else(|| s.later.iter().next().cloned());
-                    if let Some(path) = next {
+                    let next = s.queue.pop_front().or_else(|| s.later.iter().next().map(|p| (p.clone(), None)));
+                    if let Some((path, pid)) = next {
                         s.later.remove(&path);
                         s.busy += 1;
-                        break path;
+                        break (path, pid);
                     }
                     s = self.work.wait(s).unwrap_or_else(PoisonError::into_inner);
                 }
             };
             // Temp files often vanish before their turn.
             if std::fs::symlink_metadata(&path).is_ok() {
-                let scan = catch_unwind(AssertUnwindSafe(|| engine.scan(&path, on_detection)));
+                let scan = catch_unwind(AssertUnwindSafe(|| engine.scan_grouped(&path, |found| on_file(found, pid))));
                 if scan.is_err() {
                     log::error!("{}: scan panicked; restarting this worker's engine", path.display());
                     *engine = Engine::new(engine.shared.clone());
@@ -214,9 +215,9 @@ impl Pipeline {
     }
 
     /// Queue full → `later`; `later` full → forget it all and rescan the roots (correct and bounded).
-    fn enqueue(&self, s: &mut State, path: PathBuf) {
+    fn enqueue(&self, s: &mut State, path: PathBuf, pid: Option<u32>) {
         if s.queue.len() < self.cap {
-            s.queue.push_back(path);
+            s.queue.push_back((path, pid));
         } else if s.later.len() < LATER_CAP || s.later.contains(&path) {
             s.later.insert(path);
         } else {
@@ -236,16 +237,16 @@ impl Pipeline {
             }
             let now = Instant::now();
             let state = &mut *s;
-            let ready: Vec<_> = state.pending.extract_if(|_, t| now.duration_since(*t) >= self.debounce).collect();
+            let ready: Vec<_> = state.pending.extract_if(|_, (t, _)| now.duration_since(*t) >= self.debounce).collect();
             if !ready.is_empty() {
-                for (path, _) in ready {
-                    self.enqueue(state, path);
+                for (path, (_, pid)) in ready {
+                    self.enqueue(state, path, pid);
                 }
                 self.work.notify_all();
             }
             // ponytail: each wake is O(pending); the debounce/4 floor bounds wakes under a flood at the cost of up
             // to 25% extra latency.
-            let Some(oldest) = s.pending.values().min().copied() else { continue };
+            let Some(oldest) = s.pending.values().map(|v| v.0).min() else { continue };
             let wait = (oldest + self.debounce).saturating_duration_since(now).max(self.debounce / 4);
             s = self.settle.wait_timeout(s, wait).unwrap_or_else(PoisonError::into_inner).0;
         }
@@ -300,15 +301,15 @@ mod tests {
         let scans = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                pipeline.work(&mut Engine::new(shared), &|_| {
+                pipeline.work(&mut Engine::new(shared), &|_, _| {
                     scans.fetch_add(1, Ordering::SeqCst);
                 })
             });
             for _ in 0..100 {
-                pipeline.push(file.clone());
+                pipeline.push(file.clone(), None);
                 std::thread::sleep(Duration::from_millis(10)); // ~1 s of saves, each within the debounce window
             }
-            pipeline.push(dir.join("own/hashes.txt")); // own dir: dropped
+            pipeline.push(dir.join("own/hashes.txt"), None); // own dir: dropped
             let deadline = Instant::now() + Duration::from_secs(10);
             while !pipeline.is_idle() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
@@ -325,9 +326,9 @@ mod tests {
         let (config, filter) = watching(&dir, 60_000, 1);
         let pipeline = Pipeline::new(&config, filter);
         for i in 0..100 {
-            pipeline.push(dir.join(format!("f{i}")));
+            pipeline.push(dir.join(format!("f{i}")), None);
         }
-        pipeline.push(dir.join("f99")); // already deferred: deduplicated
+        pipeline.push(dir.join("f99"), None); // already deferred: deduplicated
         pipeline.rescan();
         {
             let s = lock(&pipeline.state);
